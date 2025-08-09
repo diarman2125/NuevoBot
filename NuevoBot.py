@@ -1,19 +1,21 @@
+# NuevoBot.py
 from __future__ import annotations
 """
-NuevoBot.py – Bot de detección de ERRORES DE CUOTAS ("palp") listo para Railway
+Bot de detección de ERRORES DE CUOTAS (“palp”) listo para Railway.
 
-Cambios clave en esta edición:
-- Normalización robusta de claves de deportes antes de llamar a TheOddsAPI
-  (convierte espacios a guiones bajos y lowercase) para evitar 404.
-- Lista de deportes correcta por defecto: tennis_atp, tennis_wta, tennis_itf_men, tennis_itf_women.
-- Soporte worker 24/7 (ideal para Railway) y modo TEST opcional.
-- Alertas a Telegram en HTML. Anti-duplicados y control de umbrales.
+- Escanea tenis (ATP/WTA/ITF). Fácil de extender a otros deportes.
+- Detecta: (a) precio desfasado vs. mercado, (b) cambio brusco, (c) línea atípica.
+- Alertas a Telegram en HTML.
+- Anti-duplicados (TTL 10 min).
+- Normaliza claves de deportes para evitar 404.
+- Valida ODDS_API_KEY antes de iniciar (evita 401 inútiles).
 
-Requisitos: requests, python-dateutil, pytz
-Variables de entorno: ODDS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Requiere: requests, python-dateutil, pytz
+Env vars: ODDS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 Opcionales: SCAN_INTERVAL_SEC, UMBRAL_ERROR_PCT, UMBRAL_CAMBIO_BRUSCO_PCT, MAX_DESVIO_SPREAD, MAX_DESVIO_TOTAL,
-           BOOKMAKERS_FILTER, LOCAL_TZ, ODDS_REGIONS
+            BOOKMAKERS_FILTER, LOCAL_TZ, ODDS_REGIONS
 """
+
 import os
 import time
 import logging
@@ -26,18 +28,19 @@ import requests
 from dateutil import parser as dtparser
 import pytz
 
-# ============================= CONFIGURACIÓN ============================= #
+
+# ============================= CONFIG ============================= #
 
 @dataclass
 class LocalConfig:
     # Producción 24/7 en Railway:
-    TEST_MODE: bool = False   # True = datos simulados, no llama APIs
-    RUN_ONCE: bool = False    # True = corre una pasada y termina
+    TEST_MODE: bool = False   # True = usa datos simulados (no llama APIs)
+    RUN_ONCE: bool = False    # True = una pasada y termina
 
-    # (Solo como respaldo local) — usa ENV VARS en Railway
-    ODDS_API_KEY_INLINE: str = ""      # ← deja vacío en producción
-    TELEGRAM_TOKEN_INLINE: str = ""    # ← deja vacío en producción
-    TELEGRAM_CHAT_ID_INLINE: str = ""  # ← deja vacío en producción
+    # (Solo para pruebas locales) — en Railway usa variables de entorno
+    ODDS_API_KEY_INLINE: str = ""      # NO usar en prod
+    TELEGRAM_TOKEN_INLINE: str = ""    # NO usar en prod
+    TELEGRAM_CHAT_ID_INLINE: str = ""  # NO usar en prod
 
 LCFG = LocalConfig()
 
@@ -49,15 +52,15 @@ class Config:
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
     scan_interval_sec: int = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 
-    # Umbrales de detección (ajustables)
+    # Umbrales (tuneables)
     umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "30"))
     umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "40"))
 
-    # Desvíos de líneas (spreads/totales) — en juegos de tenis
+    # Desvíos de líneas (tenis)
     max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.5"))
     max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "2.0"))
 
-    # Casas a incluir (legales en IN preferentemente)
+    # Casas a incluir
     bookmakers_filter_csv: str = os.getenv(
         "BOOKMAKERS_FILTER",
         "fanduel,draftkings,betmgm,caesars,betrivers,espnbet,pointsbet"
@@ -83,7 +86,7 @@ class Config:
 
 CFG = Config()
 
-# Prioridad a inline si faltan env vars (facilita pruebas locales, evita en prod)
+# Para pruebas locales si faltan env vars (evitar en prod)
 if LCFG.ODDS_API_KEY_INLINE and not CFG.odds_api_key:
     CFG.odds_api_key = LCFG.ODDS_API_KEY_INLINE
 if LCFG.TELEGRAM_TOKEN_INLINE and not CFG.telegram_token:
@@ -91,10 +94,11 @@ if LCFG.TELEGRAM_TOKEN_INLINE and not CFG.telegram_token:
 if LCFG.TELEGRAM_CHAT_ID_INLINE and not CFG.telegram_chat_id:
     CFG.telegram_chat_id = LCFG.TELEGRAM_CHAT_ID_INLINE
 
-BOOKMAKERS_ALLOW = {bk.strip().lower() for bk in CFG.bookmakers_filter_csv.split(',') if bk.strip()}
+BOOKMAKERS_ALLOW = {bk.strip().lower() for bk in CFG.bookmakers_filter_csv.split(",") if bk.strip()}
 LOCAL_TZ = pytz.timezone(CFG.timezone_name)
 
-# ============================= UTILIDADES ============================= #
+
+# ============================= UTILS ============================= #
 
 def to_local(dt_str: str) -> str:
     try:
@@ -105,20 +109,14 @@ def to_local(dt_str: str) -> str:
     except Exception:
         return dt_str
 
-# decimal -> prob implícita
-
 def prob_from_decimal(odds_dec: float) -> float:
     if odds_dec <= 1e-9:
         return 0.0
     return 1.0 / odds_dec
 
-# prob -> decimal
-
 def decimal_from_prob(p: float) -> float:
     p = max(min(p, 0.999999), 1e-6)
     return 1.0 / p
-
-# American odds (para reporte)
 
 def american_from_decimal(dec: float) -> str:
     if dec <= 1.0:
@@ -128,12 +126,11 @@ def american_from_decimal(dec: float) -> str:
     else:
         return f"-{int(round(100 / (dec - 1)))}"
 
-# Normalizador de claves de deportes (evita 404 por espacios)
-
 def normalize_sport_key(k: str) -> str:
     return (k or "").strip().lower().replace(" ", "_")
 
-# ============================= CLIENTES API ============================= #
+
+# ============================= API CLIENTS ============================= #
 
 class OddsClient:
     BASE = "https://api.the-odds-api.com/v4"
@@ -145,9 +142,8 @@ class OddsClient:
         self.session.headers.update({"User-Agent": "error-odds-bot/1.5"})
 
     def fetch_odds(self, sport: str, markets: List[str]) -> List[Dict[str, Any]]:
-        sport = normalize_sport_key(sport)  # ✅ asegura formato correcto
+        sport = normalize_sport_key(sport)
         url = f"{self.BASE}/sports/{sport}/odds"
-        # Usar SIEMPRE params dict para evitar concatenaciones mal formadas (401)
         params = {
             "regions": self.regions,
             "markets": ",".join(markets),
@@ -176,14 +172,15 @@ class Telegram:
         except Exception as e:
             logging.exception("Error enviando mensaje a Telegram: %s", e)
 
+
 ODDS = OddsClient(CFG.odds_api_key, CFG.regions)
 TG = Telegram(CFG.telegram_token, CFG.telegram_chat_id)
 
-# ============================= ESTADO / CACHE ============================= #
+
+# ============================= STATE / CACHE ============================= #
 
 class State:
     def __init__(self):
-        # key: (sport_key, event_id, market, outcome_name, bookmaker)
         self.last_seen: Dict[Tuple[str, str, str, str, str], Dict[str, Any]] = {}
         self.alert_memory: Dict[str, float] = {}
 
@@ -204,14 +201,14 @@ class State:
 
 STATE = State()
 
-# ============================= DETECCIÓN ============================= #
+
+# ============================= DETECTION ============================= #
 
 @dataclass
 class MarketPoint:
     bookmaker: str
     price_dec: float
     line: Optional[float]
-
 
 def consensus_price(outcomes_prices: List[float], exclude: Optional[float] = None) -> float:
     prices = [p for p in outcomes_prices if p and p > 1.0 and p != exclude]
@@ -221,8 +218,7 @@ def consensus_price(outcomes_prices: List[float], exclude: Optional[float] = Non
         return decimal_from_prob(p_bar)
     elif prices:
         return mean(prices)
-    return float('inf')
-
+    return float("inf")
 
 def detect_error_by_price(book_price: float, market_fair: float, umbral_pct: float) -> Tuple[bool, float]:
     if market_fair <= 1.0 or book_price <= 1.0:
@@ -230,13 +226,11 @@ def detect_error_by_price(book_price: float, market_fair: float, umbral_pct: flo
     diff = (book_price - market_fair) / market_fair * 100.0
     return (diff >= umbral_pct), diff
 
-
 def detect_sudden_change(prev: Optional[float], current: float, umbral_pct: float) -> Tuple[bool, float]:
     if not prev or prev <= 0 or current <= 0:
         return False, 0.0
     change = (current - prev) / prev * 100.0
     return (abs(change) >= umbral_pct), change
-
 
 def detect_line_outlier(this_line: Optional[float], peer_lines: List[float], max_dev: float) -> Tuple[bool, float]:
     if this_line is None:
@@ -248,7 +242,8 @@ def detect_line_outlier(this_line: Optional[float], peer_lines: List[float], max
     dev = this_line - med
     return (abs(dev) >= max_dev), dev
 
-# ============================= ALERTAS ============================= #
+
+# ============================= ALERTS ============================= #
 
 def fmt_alert(
     sport: str,
@@ -284,7 +279,8 @@ def fmt_alert(
     lines.append("\n⚠️ Posible 'palp'. Stake moderado: la casa puede anular si confirma error.")
     return "\n".join(lines)
 
-# ============================= PROCESAMIENTO ============================= #
+
+# ============================= PROCESS ============================= #
 
 def process_event(event: Dict[str, Any], sport_key: str):
     sport_title = event.get("sport_title", "")
@@ -308,8 +304,8 @@ def process_event(event: Dict[str, Any], sport_key: str):
             outcomes = mkt.get("outcomes", [])
             for out in outcomes:
                 name = out.get("name", "")
-                price = out.get("price")  # decimal
-                point = out.get("point")   # spread/total line
+                price = out.get("price")
+                point = out.get("point")
                 if not price or price <= 1.0:
                     continue
                 outcomes_map.setdefault((mkt_key, name), []).append(
@@ -358,48 +354,45 @@ def process_event(event: Dict[str, Any], sport_key: str):
                 )
                 TG.send(msg)
 
-# ============================= EJECUCIÓN ============================= #
+
+# ============================= RUN ============================= #
 
 class OddsClientWrapper:
     def __init__(self, odds_client: OddsClient):
         self.odds_client = odds_client
 
     def fetch_odds(self, sport: str, markets: List[str]) -> List[Dict[str, Any]]:
-        # Normaliza SIEMPRE antes de pasar a la API
         sport = normalize_sport_key(sport)
         if LCFG.TEST_MODE:
-            # Datos simulados mínimos (1 evento con precio anómalo)
-            return [
-                {
-                    "id": "evt123",
-                    "sport_title": "ATP Sample",
-                    "commence_time": datetime.now(timezone.utc).isoformat(),
-                    "home_team": "Jugador A",
-                    "away_team": "Jugador B",
-                    "bookmakers": [
-                        {"key": "fanduel", "title": "FanDuel", "markets": [
-                            {"key": "h2h", "outcomes": [
-                                {"name": "Jugador A", "price": 7.00},
-                                {"name": "Jugador B", "price": 1.45},
-                            ]}
-                        ]},
-                        {"key": "draftkings", "title": "DraftKings", "markets": [
-                            {"key": "h2h", "outcomes": [
-                                {"name": "Jugador A", "price": 3.80},
-                                {"name": "Jugador B", "price": 1.28},
-                            ]}
-                        ]},
-                        {"key": "betmgm", "title": "BetMGM", "markets": [
-                            {"key": "h2h", "outcomes": [
-                                {"name": "Jugador A", "price": 3.70},
-                                {"name": "Jugador B", "price": 1.30},
-                            ]}
-                        ]},
-                    ]
-                }
-            ]
-        else:
-            return self.odds_client.fetch_odds(sport, markets)
+            # Datos simulados (1 evento con precio anómalo) para pruebas locales
+            return [{
+                "id": "evt123",
+                "sport_title": "ATP Sample",
+                "commence_time": datetime.now(timezone.utc).isoformat(),
+                "home_team": "Jugador A",
+                "away_team": "Jugador B",
+                "bookmakers": [
+                    {"key": "fanduel", "title": "FanDuel", "markets": [
+                        {"key": "h2h", "outcomes": [
+                            {"name": "Jugador A", "price": 7.00},
+                            {"name": "Jugador B", "price": 1.45},
+                        ]}
+                    ]},
+                    {"key": "draftkings", "title": "DraftKings", "markets": [
+                        {"key": "h2h", "outcomes": [
+                            {"name": "Jugador A", "price": 3.80},
+                            {"name": "Jugador B", "price": 1.28},
+                        ]}
+                    ]},
+                    {"key": "betmgm", "title": "BetMGM", "markets": [
+                        {"key": "h2h", "outcomes": [
+                            {"name": "Jugador A", "price": 3.70},
+                            {"name": "Jugador B", "price": 1.30},
+                        ]}
+                    ]},
+                ]
+            }]
+        return self.odds_client.fetch_odds(sport, markets)
 
 
 def run_once(odds_wrapper: OddsClientWrapper):
@@ -420,9 +413,14 @@ def run_once(odds_wrapper: OddsClientWrapper):
 
 def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
-    logging.info("Iniciando bot de errores de cuotas… TEST_MODE=%s | RUN_ONCE=%s", LCFG.TEST_MODE, LCFG.RUN_ONCE)
+    logging.info("Iniciando bot… TEST_MODE=%s | RUN_ONCE=%s", LCFG.TEST_MODE, LCFG.RUN_ONCE)
     logging.info("Sports: %s | Markets: %s | Casas: %s", ",".join(CFG.sports), ",".join(CFG.markets), ",".join(sorted(BOOKMAKERS_ALLOW)))
-    # Log seguro para depurar keys sin exponerlas
+
+    # Validación estricta de API key (evita 401 inútiles)
+    if not CFG.odds_api_key or len(CFG.odds_api_key.strip()) == 0:
+        logging.critical("ODDS_API_KEY está vacía o no configurada. Configúrala en Railway → Variables.")
+        raise SystemExit(1)
+
     logging.info("API key length: %s | Telegram token length: %s", len(CFG.odds_api_key or ''), len(CFG.telegram_token or ''))
 
     odds_wrapper = OddsClientWrapper(ODDS)
