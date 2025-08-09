@@ -1,1 +1,1 @@
-web: bash start.sh
+python NuevoBot.py
