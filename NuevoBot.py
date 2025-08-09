@@ -142,16 +142,17 @@ class OddsClient:
         self.api_key = api_key
         self.regions = regions
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "error-odds-bot/1.4"})
+        self.session.headers.update({"User-Agent": "error-odds-bot/1.5"})
 
     def fetch_odds(self, sport: str, markets: List[str]) -> List[Dict[str, Any]]:
         sport = normalize_sport_key(sport)  # ✅ asegura formato correcto
         url = f"{self.BASE}/sports/{sport}/odds"
+        # Usar SIEMPRE params dict para evitar concatenaciones mal formadas (401)
         params = {
             "regions": self.regions,
             "markets": ",".join(markets),
             "apiKey": self.api_key,
-            "oddsFormat": "decimal"
+            "oddsFormat": "decimal",
         }
         r = self.session.get(url, params=params, timeout=30)
         r.raise_for_status()
@@ -421,6 +422,8 @@ def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
     logging.info("Iniciando bot de errores de cuotas… TEST_MODE=%s | RUN_ONCE=%s", LCFG.TEST_MODE, LCFG.RUN_ONCE)
     logging.info("Sports: %s | Markets: %s | Casas: %s", ",".join(CFG.sports), ",".join(CFG.markets), ",".join(sorted(BOOKMAKERS_ALLOW)))
+    # Log seguro para depurar keys sin exponerlas
+    logging.info("API key length: %s | Telegram token length: %s", len(CFG.odds_api_key or ''), len(CFG.telegram_token or ''))
 
     odds_wrapper = OddsClientWrapper(ODDS)
 
