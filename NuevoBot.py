@@ -5,15 +5,10 @@ Bot de detección de ERRORES DE CUOTAS (“palp”) listo para Railway.
 
 - Escanea tenis (ATP/WTA/ITF). Fácil de extender a otros deportes.
 - Detecta: (a) precio desfasado vs. mercado, (b) cambio brusco, (c) línea atípica.
-- Alertas a Telegram en HTML.
-- Anti-duplicados (TTL 10 min).
+- Alertas a Telegram en HTML. Anti-duplicados (TTL 10 min).
 - Normaliza claves de deportes para evitar 404.
 - Valida ODDS_API_KEY antes de iniciar (evita 401 inútiles).
-
-Requiere: requests, python-dateutil, pytz
-Env vars: ODDS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-Opcionales: SCAN_INTERVAL_SEC, UMBRAL_ERROR_PCT, UMBRAL_CAMBIO_BRUSCO_PCT, MAX_DESVIO_SPREAD, MAX_DESVIO_TOTAL,
-            BOOKMAKERS_FILTER, LOCAL_TZ, ODDS_REGIONS
+- **Nuevo:** Autodescubre los sports disponibles y filtra para evitar 404 masivos.
 """
 
 import os
@@ -25,6 +20,7 @@ from statistics import mean, median
 from datetime import datetime, timezone
 
 import requests
+from requests import HTTPError
 from dateutil import parser as dtparser
 import pytz
 
@@ -33,7 +29,6 @@ import pytz
 
 @dataclass
 class LocalConfig:
-    # Producción 24/7 en Railway:
     TEST_MODE: bool = False   # True = usa datos simulados (no llama APIs)
     RUN_ONCE: bool = False    # True = una pasada y termina
 
@@ -139,7 +134,14 @@ class OddsClient:
         self.api_key = api_key
         self.regions = regions
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "error-odds-bot/1.5"})
+        self.session.headers.update({"User-Agent": "error-odds-bot/1.6"})
+
+    def list_sports(self) -> List[Dict[str, Any]]:
+        url = f"{self.BASE}/sports"
+        params = {"apiKey": self.api_key}
+        r = self.session.get(url, params=params, timeout=30)
+        r.raise_for_status()
+        return r.json()
 
     def fetch_odds(self, sport: str, markets: List[str]) -> List[Dict[str, Any]]:
         sport = normalize_sport_key(sport)
@@ -401,9 +403,16 @@ def run_once(odds_wrapper: OddsClientWrapper):
         logging.info("Consultando cuotas para sport='%s' (normalizado='%s')", sport, sport_norm)
         try:
             data = odds_wrapper.fetch_odds(sport_norm, CFG.markets)
+        except HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logging.info("Sin datos para %s (404). Lo omito por ahora.", sport_norm)
+                continue
+            logging.exception("Error consultando cuotas para %s: %s", sport_norm, e)
+            continue
         except Exception as e:
             logging.exception("Error consultando cuotas para %s: %s", sport_norm, e)
             continue
+
         for event in data:
             try:
                 process_event(event, sport_norm)
@@ -414,13 +423,29 @@ def run_once(odds_wrapper: OddsClientWrapper):
 def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
     logging.info("Iniciando bot… TEST_MODE=%s | RUN_ONCE=%s", LCFG.TEST_MODE, LCFG.RUN_ONCE)
-    logging.info("Sports: %s | Markets: %s | Casas: %s", ",".join(CFG.sports), ",".join(CFG.markets), ",".join(sorted(BOOKMAKERS_ALLOW)))
+    logging.info("Sports config (antes de filtrar): %s", ",".join(CFG.sports))
 
-    # Validación estricta de API key (evita 401 inútiles)
+    # Validación estricta de API key
     if not CFG.odds_api_key or len(CFG.odds_api_key.strip()) == 0:
         logging.critical("ODDS_API_KEY está vacía o no configurada. Configúrala en Railway → Variables.")
         raise SystemExit(1)
 
+    # Autodescubrir sports disponibles y filtrar
+    try:
+        available_list = ODDS.list_sports()
+        available = {s.get("key") for s in available_list if isinstance(s, dict)}
+        wanted = list(CFG.sports)
+        filtered = [s for s in wanted if s in available]
+        missing = [s for s in wanted if s not in available]
+        if filtered:
+            CFG.sports = filtered
+        if missing:
+            logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
+        logging.info("Sports finales: %s", ",".join(CFG.sports))
+    except Exception as e:
+        logging.exception("No se pudo listar sports; sigo con la lista estática. Error: %s", e)
+
+    logging.info("Markets: %s | Casas: %s", ",".join(CFG.markets), ",".join(sorted(BOOKMAKERS_ALLOW)))
     logging.info("API key length: %s | Telegram token length: %s", len(CFG.odds_api_key or ''), len(CFG.telegram_token or ''))
 
     odds_wrapper = OddsClientWrapper(ODDS)
