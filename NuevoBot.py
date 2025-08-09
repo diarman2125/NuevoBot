@@ -48,12 +48,12 @@ class Config:
     scan_interval_sec: int = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 
     # Umbrales (tuneables)
-    umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "15"))
-    umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "20"))
+    umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "30"))
+    umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "40"))
 
     # Desvíos de líneas (tenis)
-    max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.0"))
-    max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "1.5"))
+    max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.5"))
+    max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "2.0"))
 
     # Casas a incluir
     bookmakers_filter_csv: str = os.getenv(
@@ -430,18 +430,24 @@ def main():
         logging.critical("ODDS_API_KEY está vacía o no configurada. Configúrala en Railway → Variables.")
         raise SystemExit(1)
 
-    # Autodescubrir sports disponibles y filtrar
+    # Autodescubrir sports y usar SOLO los que la API expose para TENIS
     try:
         available_list = ODDS.list_sports()
-        available = {s.get("key") for s in available_list if isinstance(s, dict)}
-        wanted = list(CFG.sports)
-        filtered = [s for s in wanted if s in available]
-        missing = [s for s in wanted if s not in available]
-        if filtered:
-            CFG.sports = filtered
-        if missing:
-            logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
-        logging.info("Sports finales: %s", ",".join(CFG.sports))
+        # set de claves disponibles
+        available = {s.get("key") for s in available_list if isinstance(s, dict) and s.get("key")}
+        # 1) Descubrir todos los deportes de tenis vigentes según la API
+        discovered_tennis = sorted(k for k in available if k.startswith("tennis"))
+        # 2) Si la API devolvió claves de tenis, usarlas; si no, filtrar la lista actual
+        if discovered_tennis:
+            CFG.sports = discovered_tennis
+            logging.info("Sports de TENIS detectados por la API: %s", ", ".join(CFG.sports))
+        else:
+            wanted = list(CFG.sports)
+            CFG.sports = [s for s in wanted if s in available]
+            missing = [s for s in wanted if s not in available]
+            if missing:
+                logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
+            logging.info("Sports finales: %s", ",".join(CFG.sports))
     except Exception as e:
         logging.exception("No se pudo listar sports; sigo con la lista estática. Error: %s", e)
 
