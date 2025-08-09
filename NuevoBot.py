@@ -1,36 +1,27 @@
-"""
-Bot Errores de Cuotas (PALP) – Railway Ready ✅
-
-Un solo archivo para desplegar en Railway. Incluye:
-- Escaneo de tenis (ATP/WTA/ITF) + extensible a otros deportes.
-- Detección por: (a) precio desfasado vs. mercado, (b) cambio brusco, (c) línea atípica.
-- Anti-duplicados (TTL 10 min).
-- Alertas a Telegram (HTML).
-- TEST_MODE y RUN_ONCE para pruebas locales.
-
-Requisitos (añade en Railway → Variables):
-  ODDS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  (Opcionales) SCAN_INTERVAL_SEC, UMBRAL_ERROR_PCT, UMBRAL_CAMBIO_BRUSCO_PCT, MAX_DESVIO_SPREAD, MAX_DESVIO_TOTAL,
-               BOOKMAKERS_FILTER, LOCAL_TZ, ODDS_REGIONS
-
-Instalación (Railway → Deployments → Nixpacks auto):
-  - Python se detecta solo.
-  - Define Start Command:  python main.py
-
-Notas de seguridad:
-  1) Te dejo inline las claves que compartiste para tu prueba inicial. MUY RECOMENDADO moverlas a variables de entorno y borrar/rotar el token luego.
-  2) TEST_MODE=False y RUN_ONCE=False para 24/7.
-"""
 from __future__ import annotations
+"""
+NuevoBot.py – Bot de detección de ERRORES DE CUOTAS ("palp") listo para Railway
+
+Cambios clave en esta edición:
+- Normalización robusta de claves de deportes antes de llamar a TheOddsAPI
+  (convierte espacios a guiones bajos y lowercase) para evitar 404.
+- Lista de deportes correcta por defecto: tennis_atp, tennis_wta, tennis_itf_men, tennis_itf_women.
+- Soporte worker 24/7 (ideal para Railway) y modo TEST opcional.
+- Alertas a Telegram en HTML. Anti-duplicados y control de umbrales.
+
+Requisitos: requests, python-dateutil, pytz
+Variables de entorno: ODDS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+Opcionales: SCAN_INTERVAL_SEC, UMBRAL_ERROR_PCT, UMBRAL_CAMBIO_BRUSCO_PCT, MAX_DESVIO_SPREAD, MAX_DESVIO_TOTAL,
+           BOOKMAKERS_FILTER, LOCAL_TZ, ODDS_REGIONS
+"""
 import os
 import time
-import json
+import logging
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Any
 from statistics import mean, median
 from datetime import datetime, timezone
 
-import logging
 import requests
 from dateutil import parser as dtparser
 import pytz
@@ -39,14 +30,14 @@ import pytz
 
 @dataclass
 class LocalConfig:
-    # Cambia a False/False en producción 24/7
-    TEST_MODE: bool = False  # True = usa datos simulados y NO llama APIs
-    RUN_ONCE: bool = False   # True = corre una pasada y termina
+    # Producción 24/7 en Railway:
+    TEST_MODE: bool = False   # True = datos simulados, no llama APIs
+    RUN_ONCE: bool = False    # True = corre una pasada y termina
 
-    # (Solo para pruebas rápidas) – RECOMENDADO usar ENV VARS en Railway
-    ODDS_API_KEY_INLINE: str = "c3ef41bcf9b41bcc951a8ad2849d5826"   # ← Mover a ODDS_API_KEY
-    TELEGRAM_TOKEN_INLINE: str = "7832901058:AAFgN50OSur_N24dGt-v1nwcQ4f3Rf8qsyE"  # ← Mover a TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID_INLINE: str = "5350016908"                     # ← Mover a TELEGRAM_CHAT_ID
+    # (Solo como respaldo local) — usa ENV VARS en Railway
+    ODDS_API_KEY_INLINE: str = ""      # ← deja vacío en producción
+    TELEGRAM_TOKEN_INLINE: str = ""    # ← deja vacío en producción
+    TELEGRAM_CHAT_ID_INLINE: str = ""  # ← deja vacío en producción
 
 LCFG = LocalConfig()
 
@@ -62,7 +53,7 @@ class Config:
     umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "30"))
     umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "40"))
 
-    # Desvíos líneos (spreads/totales)
+    # Desvíos de líneas (spreads/totales) — en juegos de tenis
     max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.5"))
     max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "2.0"))
 
@@ -86,15 +77,13 @@ class Config:
                 "tennis_wta",
                 "tennis_itf_men",
                 "tennis_itf_women",
-                # Puedes agregar más deportes aquí
-                # "soccer_usa_mls", "basketball_nba", "baseball_mlb"
             ]
         if self.markets is None:
             self.markets = ["h2h", "spreads", "totals"]
 
 CFG = Config()
 
-# Prioridad a inline si TEST_MODE o si no hay env var (para facilitar pruebas rápidas)
+# Prioridad a inline si faltan env vars (facilita pruebas locales, evita en prod)
 if LCFG.ODDS_API_KEY_INLINE and not CFG.odds_api_key:
     CFG.odds_api_key = LCFG.ODDS_API_KEY_INLINE
 if LCFG.TELEGRAM_TOKEN_INLINE and not CFG.telegram_token:
@@ -139,6 +128,11 @@ def american_from_decimal(dec: float) -> str:
     else:
         return f"-{int(round(100 / (dec - 1)))}"
 
+# Normalizador de claves de deportes (evita 404 por espacios)
+
+def normalize_sport_key(k: str) -> str:
+    return (k or "").strip().lower().replace(" ", "_")
+
 # ============================= CLIENTES API ============================= #
 
 class OddsClient:
@@ -148,9 +142,10 @@ class OddsClient:
         self.api_key = api_key
         self.regions = regions
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "error-odds-bot/1.3"})
+        self.session.headers.update({"User-Agent": "error-odds-bot/1.4"})
 
     def fetch_odds(self, sport: str, markets: List[str]) -> List[Dict[str, Any]]:
+        sport = normalize_sport_key(sport)  # ✅ asegura formato correcto
         url = f"{self.BASE}/sports/{sport}/odds"
         params = {
             "regions": self.regions,
@@ -364,54 +359,62 @@ def process_event(event: Dict[str, Any], sport_key: str):
 
 # ============================= EJECUCIÓN ============================= #
 
-def fetch_odds_wrapper(sport: str, markets: List[str]) -> List[Dict[str, Any]]:
-    if LCFG.TEST_MODE:
-        # Datos simulados mínimos (1 evento, h2h con una cuota errónea grande)
-        return [
-            {
-                "id": "evt123",
-                "sport_title": "ATP Sample",
-                "commence_time": datetime.now(timezone.utc).isoformat(),
-                "home_team": "Jugador A",
-                "away_team": "Jugador B",
-                "bookmakers": [
-                    {"key": "fanduel", "title": "FanDuel", "markets": [
-                        {"key": "h2h", "outcomes": [
-                            {"name": "Jugador A", "price": 7.00},
-                            {"name": "Jugador B", "price": 1.45},
-                        ]}
-                    ]},
-                    {"key": "draftkings", "title": "DraftKings", "markets": [
-                        {"key": "h2h", "outcomes": [
-                            {"name": "Jugador A", "price": 3.80},
-                            {"name": "Jugador B", "price": 1.28},
-                        ]}
-                    ]},
-                    {"key": "betmgm", "title": "BetMGM", "markets": [
-                        {"key": "h2h", "outcomes": [
-                            {"name": "Jugador A", "price": 3.70},
-                            {"name": "Jugador B", "price": 1.30},
-                        ]}
-                    ]},
-                ]
-            }
-        ]
-    else:
-        return ODDS.fetch_odds(sport, markets)
+class OddsClientWrapper:
+    def __init__(self, odds_client: OddsClient):
+        self.odds_client = odds_client
+
+    def fetch_odds(self, sport: str, markets: List[str]) -> List[Dict[str, Any]]:
+        # Normaliza SIEMPRE antes de pasar a la API
+        sport = normalize_sport_key(sport)
+        if LCFG.TEST_MODE:
+            # Datos simulados mínimos (1 evento con precio anómalo)
+            return [
+                {
+                    "id": "evt123",
+                    "sport_title": "ATP Sample",
+                    "commence_time": datetime.now(timezone.utc).isoformat(),
+                    "home_team": "Jugador A",
+                    "away_team": "Jugador B",
+                    "bookmakers": [
+                        {"key": "fanduel", "title": "FanDuel", "markets": [
+                            {"key": "h2h", "outcomes": [
+                                {"name": "Jugador A", "price": 7.00},
+                                {"name": "Jugador B", "price": 1.45},
+                            ]}
+                        ]},
+                        {"key": "draftkings", "title": "DraftKings", "markets": [
+                            {"key": "h2h", "outcomes": [
+                                {"name": "Jugador A", "price": 3.80},
+                                {"name": "Jugador B", "price": 1.28},
+                            ]}
+                        ]},
+                        {"key": "betmgm", "title": "BetMGM", "markets": [
+                            {"key": "h2h", "outcomes": [
+                                {"name": "Jugador A", "price": 3.70},
+                                {"name": "Jugador B", "price": 1.30},
+                            ]}
+                        ]},
+                    ]
+                }
+            ]
+        else:
+            return self.odds_client.fetch_odds(sport, markets)
 
 
-def run_once():
+def run_once(odds_wrapper: OddsClientWrapper):
     for sport in CFG.sports:
+        sport_norm = normalize_sport_key(sport)
+        logging.info("Consultando cuotas para sport='%s' (normalizado='%s')", sport, sport_norm)
         try:
-            data = fetch_odds_wrapper(sport, CFG.markets)
+            data = odds_wrapper.fetch_odds(sport_norm, CFG.markets)
         except Exception as e:
-            logging.exception("Error consultando cuotas para %s: %s", sport, e)
+            logging.exception("Error consultando cuotas para %s: %s", sport_norm, e)
             continue
         for event in data:
             try:
-                process_event(event, sport)
+                process_event(event, sport_norm)
             except Exception:
-                logging.exception("Error procesando evento en %s", sport)
+                logging.exception("Error procesando evento en %s", sport_norm)
 
 
 def main():
@@ -419,13 +422,15 @@ def main():
     logging.info("Iniciando bot de errores de cuotas… TEST_MODE=%s | RUN_ONCE=%s", LCFG.TEST_MODE, LCFG.RUN_ONCE)
     logging.info("Sports: %s | Markets: %s | Casas: %s", ",".join(CFG.sports), ",".join(CFG.markets), ",".join(sorted(BOOKMAKERS_ALLOW)))
 
+    odds_wrapper = OddsClientWrapper(ODDS)
+
     if LCFG.RUN_ONCE:
-        run_once()
+        run_once(odds_wrapper)
         return
 
     while True:
         start = time.time()
-        run_once()
+        run_once(odds_wrapper)
         elapsed = time.time() - start
         sleep_for = max(1, CFG.scan_interval_sec - int(elapsed))
         time.sleep(sleep_for)
