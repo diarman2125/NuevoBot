@@ -48,12 +48,12 @@ class Config:
     scan_interval_sec: int = int(os.getenv("SCAN_INTERVAL_SEC", "60"))
 
     # Umbrales (tuneables)
-    umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "30"))
-    umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "40"))
+    umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "15"))
+    umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "20"))
 
     # Desvíos de líneas (tenis)
-    max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.5"))
-    max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "2.0"))
+    max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.0"))
+    max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "1.5"))
 
     # Casas a incluir
     bookmakers_filter_csv: str = os.getenv(
