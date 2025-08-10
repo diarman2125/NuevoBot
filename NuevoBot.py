@@ -474,6 +474,6 @@ def main():
         sleep_for = max(1, CFG.scan_interval_sec - int(elapsed))
         time.sleep(sleep_for)
 
-
+# Despliegue forzado
 if __name__ == "__main__":
     main()
