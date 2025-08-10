@@ -335,7 +335,8 @@ def process_event(event: Dict[str, Any], sport_key: str):
                 outlier, dev = detect_line_outlier(mp.line, lines_map.get("totals", []), CFG.max_desvio_total)
                 line_info = f"Total {mp.line:.1f}{f' (desvío {dev:+.1f})' if outlier else ''}" if mp.line is not None else None
 
-            should_alert = is_err or changed or (line_info and "desvío" in line_info)
+            line_outlier_alert = (line_info and "desvío" in line_info) and (diff_pct >= CFG.umbral_error_pct)
+            should_alert = is_err or changed or line_outlier_alert
             if should_alert:
                 dedup_key = f"{event_id}|{mkt_key}|{name}|{mp.bookmaker}|{round(mp.price_dec,2)}"
                 if STATE.should_suppress(dedup_key):
@@ -430,24 +431,18 @@ def main():
         logging.critical("ODDS_API_KEY está vacía o no configurada. Configúrala en Railway → Variables.")
         raise SystemExit(1)
 
-    # Autodescubrir sports y usar SOLO los que la API expose para TENIS
+    # Autodescubrir sports disponibles y filtrar
     try:
         available_list = ODDS.list_sports()
-        # set de claves disponibles
-        available = {s.get("key") for s in available_list if isinstance(s, dict) and s.get("key")}
-        # 1) Descubrir todos los deportes de tenis vigentes según la API
-        discovered_tennis = sorted(k for k in available if k.startswith("tennis"))
-        # 2) Si la API devolvió claves de tenis, usarlas; si no, filtrar la lista actual
-        if discovered_tennis:
-            CFG.sports = discovered_tennis
-            logging.info("Sports de TENIS detectados por la API: %s", ", ".join(CFG.sports))
-        else:
-            wanted = list(CFG.sports)
-            CFG.sports = [s for s in wanted if s in available]
-            missing = [s for s in wanted if s not in available]
-            if missing:
-                logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
-            logging.info("Sports finales: %s", ",".join(CFG.sports))
+        available = {s.get("key") for s in available_list if isinstance(s, dict)}
+        wanted = list(CFG.sports)
+        filtered = [s for s in wanted if s in available]
+        missing = [s for s in wanted if s not in available]
+        if filtered:
+            CFG.sports = filtered
+        if missing:
+            logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
+        logging.info("Sports finales: %s", ",".join(CFG.sports))
     except Exception as e:
         logging.exception("No se pudo listar sports; sigo con la lista estática. Error: %s", e)
 
