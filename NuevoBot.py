@@ -51,6 +51,9 @@ class Config:
     umbral_error_pct: float = float(os.getenv("UMBRAL_ERROR_PCT", "30"))
     umbral_cambio_brusco_pct: float = float(os.getenv("UMBRAL_CAMBIO_BRUSCO_PCT", "40"))
 
+    # Umbral mínimo de diferencia de precio para alertar por outlier de línea
+    min_price_diff_for_line_alert: float = float(os.getenv("MIN_PRICE_DIFF_FOR_LINE_ALERT", os.getenv("UMBRAL_ERROR_PCT", "30")))
+
     # Desvíos de líneas (tenis)
     max_desvio_spread: float = float(os.getenv("MAX_DESVIO_SPREAD", "1.5"))
     max_desvio_total: float = float(os.getenv("MAX_DESVIO_TOTAL", "2.0"))
@@ -328,14 +331,17 @@ def process_event(event: Dict[str, Any], sport_key: str):
             STATE.update_price(prev_key, mp.price_dec)
 
             line_info = None
+            line_has_outlier = False
             if mkt_key == "spreads":
                 outlier, dev = detect_line_outlier(mp.line, lines_map.get("spreads", []), CFG.max_desvio_spread)
+                line_has_outlier = outlier
                 line_info = f"Spread {mp.line:+.1f}{f' (desvío {dev:+.1f})' if outlier else ''}" if mp.line is not None else None
             elif mkt_key == "totals":
                 outlier, dev = detect_line_outlier(mp.line, lines_map.get("totals", []), CFG.max_desvio_total)
+                line_has_outlier = outlier
                 line_info = f"Total {mp.line:.1f}{f' (desvío {dev:+.1f})' if outlier else ''}" if mp.line is not None else None
 
-            line_outlier_alert = (line_info and "desvío" in line_info) and (diff_pct >= CFG.umbral_error_pct)
+            line_outlier_alert = line_has_outlier and (diff_pct >= CFG.min_price_diff_for_line_alert)
             should_alert = is_err or changed or line_outlier_alert
             if should_alert:
                 dedup_key = f"{event_id}|{mkt_key}|{name}|{mp.bookmaker}|{round(mp.price_dec,2)}"
@@ -431,18 +437,24 @@ def main():
         logging.critical("ODDS_API_KEY está vacía o no configurada. Configúrala en Railway → Variables.")
         raise SystemExit(1)
 
-    # Autodescubrir sports disponibles y filtrar
+    # Autodescubrir sports y usar SOLO los que la API expose para TENIS
     try:
         available_list = ODDS.list_sports()
-        available = {s.get("key") for s in available_list if isinstance(s, dict)}
-        wanted = list(CFG.sports)
-        filtered = [s for s in wanted if s in available]
-        missing = [s for s in wanted if s not in available]
-        if filtered:
-            CFG.sports = filtered
-        if missing:
-            logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
-        logging.info("Sports finales: %s", ",".join(CFG.sports))
+        # set de claves disponibles
+        available = {s.get("key") for s in available_list if isinstance(s, dict) and s.get("key")}
+        # 1) Descubrir todos los deportes de tenis vigentes según la API
+        discovered_tennis = sorted(k for k in available if k.startswith("tennis"))
+        # 2) Si la API devolvió claves de tenis, usarlas; si no, filtrar la lista actual
+        if discovered_tennis:
+            CFG.sports = discovered_tennis
+            logging.info("Sports de TENIS detectados por la API: %s", ", ".join(CFG.sports))
+        else:
+            wanted = list(CFG.sports)
+            CFG.sports = [s for s in wanted if s in available]
+            missing = [s for s in wanted if s not in available]
+            if missing:
+                logging.info("Sports no disponibles (omitidos): %s", ", ".join(missing))
+            logging.info("Sports finales: %s", ",".join(CFG.sports))
     except Exception as e:
         logging.exception("No se pudo listar sports; sigo con la lista estática. Error: %s", e)
 
