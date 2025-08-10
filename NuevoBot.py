@@ -61,7 +61,7 @@ class Config:
     # Casas a incluir
     bookmakers_filter_csv: str = os.getenv(
         "BOOKMAKERS_FILTER",
-        "fanduel,draftkings,betmgm,caesars,betrivers,espnbet,pointsbet"
+        "fanduel,draftkings,betmgm,caesars,betrivers,espnbet,fanatics"
     )
 
     # Deportes/ligas a escanear
