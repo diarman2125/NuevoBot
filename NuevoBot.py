@@ -63,6 +63,45 @@ if LCFG.TELEGRAM_CHAT_ID_INLINE and not CFG.telegram_chat_id:
 BOOKMAKERS_ALLOW = {bk.strip().lower() for bk in CFG.bookmakers_filter_csv.split(",") if bk.strip()}
 LOCAL_TZ = pytz.timezone(CFG.timezone_name)
 
+# ==== Prematch-only filters ====
+import os as _os
+PREMATCH_GRACE_SEC = int(_os.getenv("PREMATCH_GRACE_SEC", "300"))  # 5 min por defecto
+
+def _parse_iso_utc(dt_str: str):
+    try:
+        dt = dtparser.isoparse(dt_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+def is_prematch_event(ev: Dict[str, Any]) -> bool:
+    # 1) Excluir si ya inició (con margen negativo) o si falta menos del GRACE (para evitar near-live)
+    dt = _parse_iso_utc(ev.get("commence_time",""))
+    now_utc = datetime.now(timezone.utc)
+    if dt is None:
+        return False
+    secs_to_start = (dt - now_utc).total_seconds()
+    if secs_to_start < PREMATCH_GRACE_SEC * -1:
+        # empezó hace más de -grace
+        return False
+    if secs_to_start < PREMATCH_GRACE_SEC:
+        # está por empezar o ya empezó dentro del margen → evitamos
+        return False
+    # 2) Excluir si el payload trae indicadores de live/in-progress
+    for k in ("in_progress","live","completed","status"):
+        v = ev.get(k)
+        if isinstance(v, bool) and v:
+            return False
+        if isinstance(v, str) and v.lower() in ("live","in_progress","in-progress","started","ongoing","closed","completed","finished"):
+            return False
+    # 3) Algunas respuestas incluyen "scores" cuando está en vivo
+    if ev.get("scores"):
+        return False
+    return True
+
+
 def to_local(dt_str: str) -> str:
     try:
         dt = dtparser.isoparse(dt_str)
@@ -259,8 +298,12 @@ def run_once(wrapper: OddsClientWrapper, sports: List[str]):
         except Exception:
             continue
         for ev in data:
-            try: process_event(ev)
-            except Exception: pass
+            try:
+                if not is_prematch_event(ev):
+                    continue
+                process_event(ev)
+            except Exception:
+                pass
 
 def main():
     logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
